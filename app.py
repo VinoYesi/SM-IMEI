@@ -3,7 +3,7 @@ import pandas as pd
 import re
 import os
 
-# --- LUHN ALGORITHM ---
+# --- CORE LOGIC ---
 def calculate_luhn(base14):
     digits = [int(d) for d in str(base14)]
     for i in range(len(digits) - 1, -1, -2):
@@ -11,79 +11,105 @@ def calculate_luhn(base14):
         digits[i] = doubled if doubled <= 9 else (doubled // 10) + (doubled % 10)
     return str((10 - (sum(digits) % 10)) % 10)
 
-# --- DATA LOADER ---
-@st.cache_data
-def load_preset_database():
-    """Loads the CSV database from the same folder as the script."""
+def load_db():
     csv_path = "samsung_offsets.csv"
     if os.path.exists(csv_path):
-        df = pd.read_csv(csv_path)
-        # Convert TAC_Prefix to string to ensure matching works
-        df['TAC_Prefix'] = df['TAC_Prefix'].astype(str)
-        return dict(zip(df['TAC_Prefix'], df['Expected_Offset']))
-    return {}
+        # Force TAC_Prefix as string to keep leading zeros
+        return pd.read_csv(csv_path, dtype={'TAC_Prefix': str})
+    # Default structure matching your image
+    return pd.DataFrame(columns=['TAC_Prefix', 'Model_Series', 'Expected_Offset', 'Type'])
 
-# --- APP SETUP ---
-st.set_page_config(page_title="Samsung IMEI Converter", layout="wide")
-st.title("📱 Samsung IMEI Converter (Database Enabled)")
+# --- APP CONFIG ---
+st.set_page_config(page_title="Samsung IMEI Pro", layout="wide")
+st.title("📱 Samsung IMEI Database Manager")
 
-# Load the database automatically
-db_offsets = load_preset_database()
-if db_offsets:
-    st.sidebar.success(f"Loaded {len(db_offsets)} model offsets from database.")
-else:
-    st.sidebar.warning("No samsung_offsets.csv found. Using manual calibration only.")
+if 'df_db' not in st.session_state:
+    st.session_state.df_db = load_db()
+
+# --- SIDEBAR: DATABASE EDITOR ---
+with st.sidebar:
+    st.header("🛠️ Database Tools")
+    
+    # Search Functionality
+    search_query = st.text_input("🔍 Search Model or TAC")
+    display_df = st.session_state.df_db
+    if search_query:
+        display_df = display_df[
+            display_df['Model_Series'].str.contains(search_query, case=False, na=False) | 
+            display_df['TAC_Prefix'].str.contains(search_query, na=False)
+        ]
+
+    st.write(f"Showing {len(display_df)} entries")
+    
+    # The Editor - Matches your Excel structure
+    edited_df = st.data_editor(
+        display_df, 
+        num_rows="dynamic", 
+        use_container_width=True,
+        column_config={
+            "TAC_Prefix": st.column_config.TextColumn("TAC Prefix (8 digits)"),
+            "Expected_Offset": st.column_config.NumberColumn("Offset", format="%d")
+        }
+    )
+    
+    if st.button("💾 Save All Changes to CSV"):
+        # If searching, we merge edits back to the main session state before saving
+        if search_query:
+            st.session_state.df_db.update(edited_df)
+        else:
+            st.session_state.df_db = edited_df
+            
+        st.session_state.df_db.to_csv("samsung_offsets.csv", index=False)
+        st.success("Database file updated!")
+
+# --- MAIN INTERFACE ---
+# Create mapping for the converter logic
+db_map = dict(zip(st.session_state.df_db['TAC_Prefix'], st.session_state.df_db['Expected_Offset']))
 
 col1, col2 = st.columns(2)
-
 with col1:
-    st.subheader("1. Calibration (Paste Examples)")
-    cal_input = st.text_area("Paste side-by-side columns (IMEI 1 | IMEI 2):", height=200)
-
+    st.subheader("1. Calibration")
+    cal_input = st.text_area("Paste samples (IMEI 1 | IMEI 2):", height=150)
 with col2:
-    st.subheader("2. Target (Paste IMEI 1 List)")
-    batch_input = st.text_area("Paste new IMEI 1s to convert:", height=200)
+    st.subheader("2. Targets")
+    batch_input = st.text_area("Paste IMEI 1 list:", height=150)
 
 if batch_input:
-    # 1. Start with database offsets
-    active_tac_map = db_offsets.copy()
-    
-    # 2. Add/Override with Manual Calibration
+    active_map = db_map.copy()
+    # Process manual calibration if provided
     if cal_input:
-        lines = cal_input.strip().split('\n')
-        for line in lines:
-            row_imeis = re.findall(r'\b\d{15}\b', line)
-            if len(row_imeis) >= 2:
-                i1, i2 = row_imeis[0], row_imeis[1]
-                tac = i1[:8]
-                offset = int(i2[:14]) - int(i1[:14])
-                active_tac_map[tac] = offset
-    
-    # 3. Process Batch
+        for line in cal_input.strip().split('\n'):
+            imeis = re.findall(r'\b\d{15}\b', line)
+            if len(imeis) >= 2:
+                active_map[imeis[0][:8]] = int(imeis[1][:14]) - int(imeis[0][:14])
+
     target_imeis = re.findall(r'\b\d{15}\b', batch_input)
     results = []
     
     for i1 in target_imeis:
-        tac_8 = i1[:8]
-        tac_6 = i1[:6] # Some older models use 6-digit TACs
+        tac = i1[:8]
+        # Get offset from DB or use Default row if available, else 8
+        default_val = db_map.get('0', 8) 
+        offset = active_map.get(tac, default_val)
         
-        # Priority: Exact 8-digit match > 6-digit match > Default (+8)
-        offset = active_tac_map.get(tac_8, active_tac_map.get(tac_6, 8))
+        # Identify Model Name from DB
+        model_info = st.session_state.df_db[st.session_state.df_db['TAC_Prefix'] == tac]
+        model_name = model_info['Model_Series'].values[0] if not model_info.empty else "Unknown"
         
         base14 = i1[:14]
-        new_base = str(int(base14) + offset).zfill(14)
+        new_base = str(int(base14) + int(offset)).zfill(14)
         i2 = new_base + calculate_luhn(new_base)
         
         results.append({
+            "Model": model_name,
             "IMEI 1": i1,
             "IMEI 2": i2,
-            "TAC": tac_8,
-            "Offset Applied": f"{offset:+}",
-            "Source": "Manual" if tac_8 in active_tac_map and cal_input else ("Database" if tac_8 in db_offsets else "Default")
+            "TAC": tac,
+            "Applied Offset": f"{int(offset):+}"
         })
 
     if results:
-        df_res = pd.DataFrame(results)
         st.divider()
-        st.dataframe(df_res, use_container_width=True)
-        st.download_button("Download CSV", df_res.to_csv(index=False), "imei_results.csv")
+        st.dataframe(pd.DataFrame(results), use_container_width=True)
+
+        
